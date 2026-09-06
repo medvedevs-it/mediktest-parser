@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Runtime data
+/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated exports, images, probes, and backups
+exports/
+images/
+probes/
+backups/
+
+# Build and packaging artifacts
+/build/
+/dist/
+/r/
+*.spec.bak
+*.egg-info/
+
+# Logs and local diagnostics
+*.log
+*.trace
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

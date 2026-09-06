@@ -1,0 +1,1 @@
+"""MedikTest collector package."""

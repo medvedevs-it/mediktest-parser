@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.docker
+build
+dist
+r
+data
+tests
+*.db
+*.log
