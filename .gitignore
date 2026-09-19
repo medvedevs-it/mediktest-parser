@@ -37,7 +37,7 @@ backups/
 /r/
 *.spec.bak
 *.egg-info/
-/release/
+release/
 
 # Logs and local diagnostics
 *.log
