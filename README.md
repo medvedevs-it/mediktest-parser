@@ -50,6 +50,66 @@ python3.12 -m venv .venv
 
 Панель откроется на <http://127.0.0.1:8765>.
 
+## Docker
+
+### Сборка и публикация образа
+
+Для сборки образа из исходников выполнить команду в корне проекта. Заменить `1.0.0` на нужный тег версии.
+
+```bash
+docker build -t medvedevs/medictest-parser:1.0.0 .
+```
+
+Автоирзоваться Docker Hub и запушить новый образ:
+
+```bash
+docker login
+docker push medvedevs/medictest-parser:1.0.0
+```
+
+### Запуск через Docker Compose
+
+Для запуска готового образа на удалённой машине достаточно перенести:
+
+```text
+docker-compose.yml
+data/              # можно создать пустой каталог
+```
+
+Docker и Docker Compose должны быть установлены на сервере. Выполните:
+
+```bash
+mkdir -p /opt/mediktest/data
+cd /opt/mediktest
+# скопируйте сюда docker-compose.yml
+docker compose pull
+docker compose up -d
+```
+
+Проверка состояния и логов:
+
+```bash
+docker compose ps
+docker compose logs -f mediktest
+curl http://127.0.0.1:8765/api/health
+```
+
+Данные сохраняются на хосте в каталоге `data/`:
+
+```text
+data/pilot.db
+data/exports/
+data/images/
+data/probes/
+```
+
+Для остановки без удаления данных:
+
+```bash
+docker compose down
+```
+
+
 ## Проверка
 
 ```bash
