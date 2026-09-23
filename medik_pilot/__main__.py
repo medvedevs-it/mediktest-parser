@@ -13,7 +13,7 @@ if __name__ == "__main__":
     no_browser = os.getenv("MEDIKTEST_NO_BROWSER", "").strip().lower()
     if no_browser not in {"1", "true", "yes", "on"}:
         threading.Thread(
-            target=lambda: (time.sleep(1.2), webbrowser.open("http://{}:{}".format(host, port))),
+            target=lambda: (time.sleep(1.2), webbrowser.open("http://127.0.0.1:{}".format(port))),
             daemon=True,
         ).start()
     uvicorn.run(app, host=host, port=port, reload=False)
