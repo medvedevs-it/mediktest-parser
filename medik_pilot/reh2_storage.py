@@ -69,15 +69,66 @@ class Reh2StorageMixin:
         state = self.reh2_state(run_id)
         if not state:
             return None
-        with self.database() as db:
-            rows = db.execute("SELECT operation, outcome, diagnostic FROM reh2_receipts WHERE run_id=?",
-                              (run_id,)).fetchall()
+        totals = self.reh2_package_stats(run_id)
+        current = self.reh2_package_stats(run_id, state['operation'])
         return {"source": "reh2", "phase": state["phase"], "package": state["package"],
                 "attempt_uid": state.get("attempt_uid"),
                 "package_count": state.get("package_count", state.get("expected", 0)),
-                "processed": sum(r["operation"] == state["operation"] for r in rows),
-                "invalid": sum(r["diagnostic"] is not None for r in rows),
-                "repeats": sum(r["outcome"] == "duplicate" for r in rows)}
+                "processed": current['received'], "repeats": totals['existing'],
+                **totals, "current_package": current}
+
+    def reh2_package_stats(self, run_id, operation=None):
+        """Counters from durable receipts, never from raw insert outcomes alone.
+
+        new_unique is relative to this run; existing means a ready record already
+        in the bank at import. The two are independent (an existing bank question
+        can be encountered for the first time in this run).
+        """
+        from .comparison import test_identity
+        with self.database() as db:
+            rows = db.execute("""SELECT r.operation,r.ordinal,r.outcome,r.diagnostic,
+                i.status,i.payload_json FROM reh2_receipts r JOIN items i ON i.id=r.item_id
+                WHERE r.run_id=? ORDER BY r.operation,r.ordinal""", (run_id,)).fetchall()
+        counts = dict(received=0, ready=0, new_unique=0, existing=0, invalid=0)
+        seen, diagnostics = set(), {}
+        for row in rows:
+            payload = json.loads(row['payload_json'])
+            reason = row['diagnostic'] or payload.get('validation_error')
+            ready = row['status'] == 'ready' and not reason
+            key = test_identity({'payload': payload}) if ready else None
+            fresh = ready and key not in seen
+            if ready:
+                seen.add(key)
+            if operation is not None and row['operation'] != operation:
+                continue
+            counts['received'] += 1
+            counts['ready'] += int(ready)
+            counts['new_unique'] += int(fresh)
+            counts['existing'] += int(ready and row['outcome'] == 'duplicate')
+            counts['invalid'] += int(not ready)
+            if not ready:
+                reason = reason or 'Запись не прошла проверку готовности.'
+                diagnostics[reason] = diagnostics.get(reason, 0) + 1
+        return {**counts, 'diagnostics': [{'reason': k, 'count': v} for k, v in diagnostics.items()]}
+
+    def reh2_attempt_was_processed(self, run_id, state):
+        # Report UID remains available after the latest operation checkpoint moves
+        # on. Scope to the same account, specialty and package; exclude resuming
+        # the current operation, whose receipts must remain idempotent.
+        with self.database() as db:
+            rows = db.execute("""SELECT p.run_id,p.operation,p.report_json,o.state_json
+                FROM reh2_reports p JOIN reh2_operations o ON o.run_id=p.run_id
+                JOIN runs r ON r.id=p.run_id WHERE r.specialty=?
+                AND NOT (p.run_id=? AND p.operation=?)
+                AND EXISTS (SELECT 1 FROM reh2_receipts c
+                    WHERE c.run_id=p.run_id AND c.operation=p.operation)""",
+                (state['specialty'], run_id, state['operation'])).fetchall()
+        for row in rows:
+            prior = json.loads(row['state_json'])
+            if prior['account'] == state['account'] and prior['package'] == state['package']:
+                if json.loads(row['report_json']).get('uid') == state['attempt_uid']:
+                    return True
+        return False
 
     def finish_reh2_package(self, run_id):
         state = self.reh2_state(run_id)

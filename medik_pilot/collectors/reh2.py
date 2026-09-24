@@ -34,6 +34,13 @@ class Reh2TransientError(Exception):
     pass
 
 
+class Reh2RepeatedAttempt(Reh2Error):
+    def __init__(self):
+        super().__init__('REH2: сайт повторно вернул ранее выданную попытку вместо новой. '
+                         'Сбор остановлен для проверки; повторный учёт запрещён. '
+                         'Это не означает, что вопросы закончились. История не сброшена.')
+
+
 class CollectionInterrupted(Exception):
     pass
 
@@ -255,6 +262,8 @@ class Reh2Collector:
             raise Reh2Error("REH2: аккаунт изменился. Продолжите прежним аккаунтом или создайте отдельный запуск.")
         if state and state["phase"] == "exhausted":
             raise Reh2SourceExhausted()
+        if state and state['phase'] == 'repeated_attempt':
+            raise Reh2RepeatedAttempt()
         no_new_packages = (state or {}).get("no_new_packages", 0)
         if state and state["phase"] == "committed" and state["operation"] != number:
             state = None
@@ -298,6 +307,11 @@ class Reh2Collector:
             state.update(attempt_uid=candidates[0]["uid"], phase="created")
             self.storage.save_reh2_state(self.run_id, state)
         uid = state["attempt_uid"]
+        if (uid in state.get('history_before', []) or
+                self.storage.reh2_attempt_was_processed(self.run_id, state)):
+            state['phase'] = 'repeated_attempt'
+            self.storage.save_reh2_state(self.run_id, state)
+            raise Reh2RepeatedAttempt()
         if state["phase"] in ("created", "finishing"):
             self.checkpoint()
             attempt = self.api.attempt(uid)

@@ -400,6 +400,12 @@ class Storage(Reh2StorageMixin):
             result["allow_answer_submission"] = bool(result.get("allow_answer_submission"))
             result["checkpoint"] = json.loads(result["checkpoint_json"]) if result.get("checkpoint_json") else {}
             result["test_progress"] = self.reh2_progress(run_id)
+            if result.get('test_source') == 'reh2':
+                # Keep historical/raw counters unchanged for compatibility; the
+                # panel must not advertise invalid diagnostic inserts as ready.
+                result['ready_outcomes'] = {r['outcome']: r['n'] for r in db.execute(
+                    "SELECT ri.outcome,COUNT(*) AS n FROM run_items ri JOIN items i ON i.id=ri.item_id "
+                    "WHERE ri.run_id=? AND i.status='ready' GROUP BY ri.outcome", (run_id,))}
             result["events"] = [
                 dict(item) for item in db.execute(
                     "SELECT level, message, created_at FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 30",

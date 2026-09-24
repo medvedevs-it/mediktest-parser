@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional
 
 from .collectors import DemoCollector, LiveSelftestCollector
 from .collectors.live import CollectionConfigurationError
-from .collectors.reh2 import Reh2Collector, Reh2TransientError, Reh2Error, Reh2SourceExhausted, CollectionInterrupted
+from .collectors.reh2 import Reh2Collector, Reh2TransientError, Reh2Error, Reh2SourceExhausted, Reh2RepeatedAttempt, CollectionInterrupted
 from .config import DATA_DIR, DB_PATH, EXPORT_DIR, IMAGE_DIR, PROBE_DIR, Settings
 from .domain import payload_status
 from .comparison import test_identity
@@ -174,6 +174,8 @@ class RunManager:
                 raise RuntimeError("Запуск не найден.")
             if (self.storage.reh2_state(run_id) or {}).get("phase") == "exhausted":
                 raise RuntimeError(str(Reh2SourceExhausted()))
+            if (self.storage.reh2_state(run_id) or {}).get("phase") == "repeated_attempt":
+                raise RuntimeError(str(Reh2RepeatedAttempt()))
             if run["source_mode"] == "live" and not self.credentials_configured():
                 raise RuntimeError("После перезапуска повторно укажите логин и пароль тренажёра.")
             if self._thread and self._thread.is_alive():
@@ -416,6 +418,8 @@ class RunManager:
                         stop_reason = "source_exhausted"
                         self.storage.add_event(run_id, str(exc), "warning")
                         break
+                    except Reh2RepeatedAttempt:
+                        raise
                     except CollectionConfigurationError as exc:
                         self.storage.add_event(run_id, str(exc), "error")
                         raise RuntimeError(str(exc)) from exc
@@ -508,7 +512,7 @@ class RunManager:
                                 self.storage.catalog_counts(config["source_mode"], config["specialty"])
                             )
                         if ready:
-                            key = test_identity({'payload':item.payload}) if kind == 'test' else item.source_id
+                            key = test_identity({'payload':stored['payload'] if stored else item.payload}) if kind == 'test' else item.source_id
                             run_seen_ids.setdefault(kind, set()).add(key)
                             run_counts[kind] = len(run_seen_ids[kind])
                         if outcome == "new":
@@ -520,7 +524,7 @@ class RunManager:
                             "source_id": item.source_id,
                             "attempt": attempt,
                             "outcome": outcome,
-                            "status": payload_status(item.kind, item.payload),
+                            "status": stored['status'] if stored else payload_status(item.kind, item.payload),
                         }
                         item_checkpoint = {
                             "attempt": attempt,
@@ -546,16 +550,24 @@ class RunManager:
                         excess = max(0, run_counts[kind] - references[kind])
                         if excess:
                             self.storage.add_event(run_id, "Пакет REH2 сохранён целиком: превышение цели на {} готовых уникальных тестов.".format(excess))
-                        if no_new_packages >= 3:
-                            stop_reason = "no_new_packages"
                     self.storage.add_attempt_stats(run_id, attempt, kind, counts)
-                    self.storage.add_event(
-                        run_id,
-                        "{}: новых {}, повторов {}, изменённых {}.".format(
-                            "Тесты" if kind == "test" else "Кейсы",
-                            counts["new"], counts["duplicate"], counts["changed"],
-                        ),
-                    )
+                    if whole_package:
+                        stats = self.storage.reh2_package_stats(run_id, attempt)
+                        self.storage.add_event(run_id,
+                            'Тесты REH2: получено {received}, готовых {ready}, '
+                            'новых уникальных для запуска {new_unique}, уже есть в банке {existing}, '
+                            'некорректных {invalid}.'.format(**stats))
+                        for diagnostic in stats['diagnostics']:
+                            self.storage.add_event(run_id, 'REH2: {} записей — {}'.format(
+                                diagnostic['count'], diagnostic['reason']), 'warning')
+                    else:
+                        self.storage.add_event(
+                            run_id,
+                            "{}: новых {}, повторов {}, изменённых {}.".format(
+                                "Тесты" if kind == "test" else "Кейсы",
+                                counts["new"], counts["duplicate"], counts["changed"],
+                            ),
+                        )
                 checkpoint = {
                     "attempt": attempt,
                     "catalog_counts": catalog_counts,
@@ -575,7 +587,7 @@ class RunManager:
                     elapsed_seconds=elapsed_seconds(),
                     checkpoint_json=json.dumps(checkpoint, ensure_ascii=False),
                 )
-                if stop_reason in ("user", "max_requests", "no_new_packages", "source_exhausted"):
+                if stop_reason in ("user", "max_requests", "source_exhausted"):
                     break
                 if all(
                     run_counts[kind] >= references[kind]
@@ -624,7 +636,7 @@ class RunManager:
             self.storage.update_run(
                 run_id,
                 status="failed",
-                stop_reason="error",
+                stop_reason="repeated_attempt" if isinstance(exc, Reh2RepeatedAttempt) else "error",
                 finished_at=utc_now(),
                 error_message=str(exc),
                 items_seen=totals["seen"],

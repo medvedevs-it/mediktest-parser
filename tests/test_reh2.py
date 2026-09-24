@@ -288,7 +288,7 @@ class Reh2Tests(unittest.TestCase):
         self.assertEqual(result['collected_by_kind']['test'],5)
         self.assertEqual(api.create_calls,1)
 
-    def test_three_duplicate_packages_stop_partial_not_complete(self):
+    def test_duplicate_packages_continue_until_attempt_limit(self):
         cfg = config()
         cfg['reference_tests']=100
         manager=RunManager(self.storage)
@@ -297,8 +297,136 @@ class Reh2Tests(unittest.TestCase):
             manager._execute('run',cfg)
         result=self.storage.get_run('run')
         self.assertEqual(result['status'],'partial',result.get('error_message'))
-        self.assertEqual(result['stop_reason'],'no_new_packages')
-        self.assertEqual(api.create_calls,4)
+        self.assertEqual(result['stop_reason'],'max_attempts')
+        self.assertEqual(api.create_calls,5)
+        self.assertEqual(result['collected_by_kind']['test'],5)
+
+    def test_three_duplicate_packages_then_new_package_both_specialties(self):
+        for specialty in (GENERAL, PEDIATRICS):
+            with self.subTest(specialty=specialty):
+                run = specialty
+                cfg = config(specialty); cfg.update(reference_tests=10, max_attempts=6)
+                self.storage.create_run(run, cfg)
+                api = FakeApi(specialty, repeated=True)
+                original = api.create
+                def create(b):
+                    api.repeated = api.create_calls < 4
+                    return original(b)
+                api.create = create
+                manager = RunManager(self.storage)
+                with patch.object(manager, '_collector', return_value=self.collector(api, run=run, specialty=specialty)):
+                    manager._execute(run, cfg)
+                result = self.storage.get_run(run)
+                self.assertEqual(result['status'], 'completed', result.get('error_message'))
+                self.assertEqual(api.create_calls, 5)
+                self.assertEqual(result['collected_by_kind']['test'], 10)
+
+    def test_ambiguous_legacy_package_exposes_invalid_not_new_ready(self):
+        # Reproduce the screenshot symptom without claiming these are client data.
+        self.storage.create_run('old', config())
+        q = question(); item = self.parse(q)
+        for identity in ('old1', 'old2'):
+            payload = copy.deepcopy(item.payload)
+            if identity == 'old2': payload['options'].reverse()
+            self.storage.store_item('old', 'live', GENERAL, CollectedItem('test', identity, payload), 0)
+        api = FakeApi(GENERAL, repeated=True); api.questions = [q]
+        manager = RunManager(self.storage)
+        with patch.object(manager, '_collector', return_value=self.collector(api)):
+            manager._execute('run', config())
+        result = self.storage.get_run('run')
+        self.assertEqual(result['stop_reason'], 'max_attempts')
+        self.assertEqual(result['test_progress']['received'], 5)
+        self.assertEqual(result['test_progress']['ready'], 0)
+        self.assertEqual(result['test_progress']['invalid'], 5)
+        self.assertEqual(result['ready_outcomes'].get('new', 0), 0)
+        self.assertTrue(any('Неоднозначное совпадение' in e['message'] for e in result['events']))
+        self.assertFalse(any('Тесты: новых' in e['message'] for e in result['events']))
+
+    def test_reused_attempt_uid_stops_before_finishing_or_accounting(self):
+        api = FakeApi(GENERAL)
+        c = self.collector(api)
+        for item in c.collect_attempt('test', 1):
+            self.storage.store_item('run', 'live', GENERAL, item, 1)
+        c.acknowledge_attempt('test')
+        uid = api.created[0]['uid']
+        api.create = Mock(return_value=uid)
+        with self.assertRaisesRegex(Reh2Error, 'повторно вернул'):
+            c.collect_attempt('test', 2)
+        with self.assertRaisesRegex(Reh2Error, 'повторно вернул'):
+            self.collector(api).collect_attempt('test', 2)
+        api.create.assert_called_once()
+        self.assertEqual(api.finish_calls, 1)
+        self.assertEqual(self.storage.reh2_run_totals('run')['seen'], 5)
+
+    def test_package_counts_survive_replay_and_partial_import(self):
+        c = self.collector()
+        items = c.collect_attempt('test', 1)
+        self.storage.store_item('run', 'live', GENERAL, items[0], 1)
+        for item in items:
+            self.storage.store_item('run', 'live', GENERAL, item, 1)
+        c.acknowledge_attempt('test')
+        stats = self.storage.reh2_package_stats('run', 1)
+        self.assertEqual({k: stats[k] for k in ('received','ready','new_unique','existing','invalid')},
+                         dict(received=5, ready=5, new_unique=5, existing=0, invalid=0))
+        for item in items: self.storage.store_item('run', 'live', GENERAL, item, 1)
+        self.assertEqual(self.storage.reh2_package_stats('run', 1), stats)
+
+    def test_old_bank_matches_count_as_ready_unique_in_new_run(self):
+        self.storage.create_run('old', config())
+        api = FakeApi(GENERAL, repeated=True)
+        for index, q in enumerate(api.questions):
+            self.storage.store_item('old', 'live', GENERAL,
+                CollectedItem('test', 'old'+str(index), self.parse(q).payload), 0)
+        manager = RunManager(self.storage)
+        with patch.object(manager, '_collector', return_value=self.collector(api)):
+            manager._execute('run', config())
+        result = self.storage.get_run('run')
+        self.assertEqual(result['status'], 'completed')
+        stats = self.storage.reh2_package_stats('run', 1)
+        self.assertEqual(stats['existing'], 5)
+        self.assertEqual(stats['new_unique'], 5)
+        self.assertEqual(result['collected_by_kind']['test'], 5)
+
+    def test_repeated_uid_guard_survives_history_omission_and_new_run(self):
+        api = FakeApi(GENERAL); c = self.collector(api)
+        for item in c.collect_attempt('test', 1):
+            self.storage.store_item('run', 'live', GENERAL, item, 1)
+        c.acknowledge_attempt('test')
+        self.storage.create_run('next', config())
+        api.history = Mock(return_value=[])
+        api.create = Mock(return_value=api.created[0]['uid'])
+        manager = RunManager(self.storage)
+        with patch.object(manager, '_collector', return_value=self.collector(api, run='next')):
+            manager._execute('next', config())
+        result = self.storage.get_run('next')
+        self.assertEqual(result['stop_reason'], 'repeated_attempt')
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['items_seen'], 0)
+        self.assertEqual(api.finish_calls, 1)
+        manager.set_credentials('account', 'not-persisted')
+        with self.assertRaisesRegex(RuntimeError, 'повторно вернул'): manager.resume('next')
+
+    def test_request_time_and_stop_limits_still_apply(self):
+        for limit in ('max_requests', 'max_duration', 'user'):
+            with self.subTest(limit=limit):
+                self.storage.create_run(limit, config())
+                manager = RunManager(self.storage); api = FakeApi(GENERAL)
+                cfg = config(); cfg['reference_tests'] = 100
+                if limit == 'max_requests': cfg['max_requests'] = 2
+                if limit == 'max_duration': cfg['max_duration_minutes'] = 0
+                if limit == 'user': manager._stop_event.set()
+                with patch.object(manager, '_collector', return_value=self.collector(api, run=limit)):
+                    manager._execute(limit, cfg)
+                result = self.storage.get_run(limit)
+                self.assertEqual(result['stop_reason'], limit)
+                self.assertEqual(result['items_seen'], 2 if limit == 'max_requests' else 0)
+
+    def test_old_no_new_packages_run_not_auto_resumed(self):
+        self.storage.update_run('run', status='partial', stop_reason='no_new_packages')
+        manager = RunManager(self.storage)
+        manager.set_credentials('account', 'not-persisted')
+        with self.assertRaises(RuntimeError): manager.resume('run')
+        self.assertEqual(self.storage.get_run('run')['stop_reason'], 'no_new_packages')
 
     def test_concurrent_progress_comparison_and_idempotent_import(self):
         item=self.parse(question())
