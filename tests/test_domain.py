@@ -36,7 +36,7 @@ from medik_pilot.images import (
 from medik_pilot.runner import RunManager
 from medik_pilot.specialties import SUPPORTED_SPECIALTIES, normalize_specialty, package_title
 from medik_pilot.storage import Storage, utc_now
-from medik_pilot.app import RunRequest, app, create_run, public_image
+from medik_pilot.app import RunRequest, app, catalog_counts, create_run, public_image
 from fastapi import HTTPException
 from pydantic import ValidationError
 
@@ -74,6 +74,20 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(request.specialty, "Педиатрия")
         with self.assertRaises(ValidationError):
             RunRequest(specialty="Стоматология")
+
+    def test_catalog_counts_endpoint_is_specialty_scoped(self):
+        with patch("medik_pilot.app.storage") as mocked_storage:
+            mocked_storage.export_bank_counts.return_value = {"test": 13, "case": 3}
+            result = catalog_counts(" педиатрия ")
+        self.assertEqual(result, {
+            "specialty": "Педиатрия",
+            "test": 13,
+            "case": 3,
+            "total": 16,
+        })
+        mocked_storage.export_bank_counts.assert_called_once_with("Педиатрия")
+        with self.assertRaises(HTTPException):
+            catalog_counts("Стоматология")
 
     def test_runner_and_storage_separate_pediatrics_bank(self):
         with tempfile.TemporaryDirectory() as directory:

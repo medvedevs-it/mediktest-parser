@@ -10,13 +10,14 @@ from .config import DB_PATH, ensure_directories
 from .domain import CollectedItem, payload_status
 from .images import iter_image_assets
 from .specialties import normalize_specialty
+from .reh2_storage import Reh2StorageMixin
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class Storage:
+class Storage(Reh2StorageMixin):
     def __init__(self, path: Path = DB_PATH):
         ensure_directories()
         self.path = Path(path)
@@ -41,6 +42,11 @@ class Storage:
 
     def initialize(self) -> None:
         with self.database() as db:
+            # Readers of progress/exports must not hold up collector commits.
+            # Set the persistent journal mode at startup, never per request.
+            mode = db.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+            if mode.lower() != "wal":
+                raise RuntimeError("SQLite WAL mode could not be enabled")
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -149,6 +155,12 @@ class Storage:
                 );
                 """
             )
+            db.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_run_items_run_item ON run_items(run_id, item_id);
+                CREATE INDEX IF NOT EXISTS idx_events_run_level ON events(run_id, level);
+                CREATE INDEX IF NOT EXISTS idx_attempt_stats_run ON attempt_stats(run_id);
+            """)
+            self.initialize_reh2(db)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)").fetchall()}
             if "max_tests" not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN max_tests INTEGER NOT NULL DEFAULT 10")
@@ -220,6 +232,19 @@ class Storage:
                    WHERE status IN ('queued', 'running', 'stopping')"""
             )
 
+    def backup(self, destination: Path) -> None:
+        """Consistent backup including committed pages still in the WAL file."""
+        destination = Path(destination)
+        if destination.resolve() == self.path.resolve():
+            raise ValueError("Backup must not overwrite the active database")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self.database() as source:
+            target = sqlite3.connect(str(destination))
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+
     def reset_all_materials(self) -> Dict[str, int]:
         """Delete the complete material bank and its run history atomically."""
         with self._lock, self.database() as db:
@@ -239,6 +264,7 @@ class Storage:
             db.execute("DELETE FROM attempt_stats")
             db.execute("DELETE FROM run_items")
             db.execute("DELETE FROM client_entity_ids")
+            db.execute("DELETE FROM test_source_aliases")
             db.execute("DELETE FROM items")
             db.execute("DELETE FROM runs")
             db.execute(
@@ -283,6 +309,7 @@ class Storage:
             db.execute("DELETE FROM runs WHERE specialty = ?", (specialty,))
             db.execute("DELETE FROM items WHERE specialty = ?", (specialty,))
             db.execute("DELETE FROM client_entity_ids WHERE specialty = ?", (specialty,))
+            db.execute("DELETE FROM test_source_aliases WHERE specialty = ?", (specialty,))
             return {
                 "specialty": specialty,
                 "deleted_tests": counts["test"],
@@ -312,6 +339,8 @@ class Storage:
         return names
 
     def create_run(self, run_id: str, config: Dict[str, Any]) -> None:
+        if config.get("test_source", "legacy") not in ("legacy", "reh2"):
+            raise ValueError("Unknown test source")
         with self._lock, self.database() as db:
             db.execute(
                 """INSERT INTO runs (
@@ -344,6 +373,7 @@ class Storage:
                     config["delay_seconds"],
                 ),
             )
+            db.execute("UPDATE runs SET test_source=? WHERE id=?", (config.get("test_source", "legacy"), run_id))
 
     def update_run(self, run_id: str, **values: Any) -> None:
         if not values:
@@ -369,6 +399,13 @@ class Storage:
             result["allow_create_attempts"] = bool(result.get("allow_create_attempts"))
             result["allow_answer_submission"] = bool(result.get("allow_answer_submission"))
             result["checkpoint"] = json.loads(result["checkpoint_json"]) if result.get("checkpoint_json") else {}
+            result["test_progress"] = self.reh2_progress(run_id)
+            if result.get('test_source') == 'reh2':
+                # Keep historical/raw counters unchanged for compatibility; the
+                # panel must not advertise invalid diagnostic inserts as ready.
+                result['ready_outcomes'] = {r['outcome']: r['n'] for r in db.execute(
+                    "SELECT ri.outcome,COUNT(*) AS n FROM run_items ri JOIN items i ON i.id=ri.item_id "
+                    "WHERE ri.run_id=? AND i.status='ready' GROUP BY ri.outcome", (run_id,))}
             result["events"] = [
                 dict(item) for item in db.execute(
                     "SELECT level, message, created_at FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 30",
@@ -394,15 +431,7 @@ class Storage:
                     (run_id,),
                 ).fetchone()["count"]
             )
-            result["collected_by_kind"] = {
-                item["kind"]: item["count"]
-                for item in db.execute(
-                    """SELECT i.kind, COUNT(DISTINCT i.source_id) AS count
-                       FROM run_items ri JOIN items i ON i.id = ri.item_id
-                       WHERE ri.run_id = ? AND i.status = 'ready' GROUP BY i.kind""",
-                    (run_id,),
-                ).fetchall()
-            }
+            result["collected_by_kind"] = {k:len(v) for k,v in self.run_ready_identity_keys(run_id).items() if v}
             result["catalog_counts"] = {
                 item["kind"]: item["count"]
                 for item in db.execute(
@@ -433,27 +462,21 @@ class Storage:
                              AND candidate.kind = latest_item.kind
                              AND candidate.source_id = latest_item.source_id
                          )
-                   ), seen AS (
-                       SELECT DISTINCT seen_item.kind, seen_item.source_id
-                       FROM run_items ri JOIN items seen_item ON seen_item.id = ri.item_id
-                       WHERE ri.run_id = ? AND seen_item.status = 'ready'
-                         AND ri.outcome IN ('new', 'duplicate', 'changed')
                    )
-                   SELECT current.kind, COUNT(*) AS total,
-                          SUM(CASE WHEN seen.source_id IS NOT NULL THEN 1 ELSE 0 END) AS confirmed
-                   FROM current
-                   LEFT JOIN seen ON seen.kind = current.kind AND seen.source_id = current.source_id
-                   GROUP BY current.kind""",
-                (result["source_mode"], result["specialty"], run_id),
+                   SELECT kind, source_id FROM current""",
+                (result["source_mode"], result["specialty"]),
             ).fetchall()
-            result["catalog_audit"] = {
-                row["kind"]: {
-                    "total": int(row["total"] or 0),
-                    "confirmed": int(row["confirmed"] or 0),
-                    "not_checked": int(row["total"] or 0) - int(row["confirmed"] or 0),
-                }
-                for row in audit_rows
-            }
+            seen = {(row['kind'], row['source_id']) for row in db.execute(
+                """SELECT i.kind,i.source_id FROM run_items ri JOIN items i ON i.id=ri.item_id
+                   WHERE ri.run_id=? AND i.status='ready'
+                   AND ri.outcome IN ('new','duplicate','changed')""", (run_id,)).fetchall()}
+            # Avoid a quadratic join of two large, unindexed intermediate sets.
+            result['catalog_audit'] = {}
+            for row in audit_rows:
+                stats = result['catalog_audit'].setdefault(row['kind'],
+                    {'total': 0, 'confirmed': 0, 'not_checked': 0})
+                stats['total'] += 1
+                stats['confirmed' if (row['kind'], row['source_id']) in seen else 'not_checked'] += 1
             return result
 
     def run_config(self, run_id: str) -> Optional[Dict[str, Any]]:
@@ -462,6 +485,7 @@ class Storage:
             return None
         return {
             "source_mode": run["source_mode"],
+            "test_source": run.get("test_source", "legacy"),
             "material_type": run["material_type"],
             "specialty": run["specialty"],
             "document_mode": run.get("document_mode", "catalog"),
@@ -486,7 +510,7 @@ class Storage:
     def list_runs(self, limit: int = 20) -> List[Dict[str, Any]]:
         with self.database() as db:
             rows = db.execute(
-                """SELECT id, source_mode, material_type, specialty, document_mode, document_name,
+                """SELECT id, source_mode, test_source, material_type, specialty, document_mode, document_name,
                           status, stop_reason,
                           created_at, started_at, finished_at, reference_tests, reference_cases,
                           items_seen, unique_items, duplicate_items, changed_items, requests_made,
@@ -497,6 +521,17 @@ class Storage:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def run_ready_identity_keys(self, run_id: str) -> Dict[str, set]:
+        from .comparison import test_identity
+        with self.database() as db:
+            rows=db.execute("""SELECT i.kind,i.source_id,i.payload_json FROM run_items ri
+                JOIN items i ON i.id=ri.item_id WHERE ri.run_id=? AND i.status='ready'""",(run_id,)).fetchall()
+        result={'test':set(),'case':set()}
+        for row in rows:
+            key=test_identity({'payload':json.loads(row['payload_json'])}) if row['kind']=='test' else row['source_id']
+            result.setdefault(row['kind'],set()).add(key)
+        return result
 
     def run_ready_source_ids(self, run_id: str) -> Dict[str, set[str]]:
         with self.database() as db:
@@ -563,6 +598,55 @@ class Storage:
                     )
                 selected[kind] = len(rows)
         return selected
+
+    def current_bank_rows(self, specialty: str) -> List[Dict[str, Any]]:
+        specialty = normalize_specialty(specialty)
+        with self.database() as db:
+            rows = db.execute("""SELECT i.* FROM items i WHERE i.source_mode='live'
+                AND i.specialty=? AND i.status='ready' AND i.version=(
+                SELECT MAX(j.version) FROM items j WHERE j.source_mode=i.source_mode
+                AND j.specialty=i.specialty AND j.kind=i.kind AND j.source_id=i.source_id)
+                ORDER BY i.kind,i.source_id""", (specialty,)).fetchall()
+        return [{**dict(row), 'payload': json.loads(row['payload_json'])} for row in rows]
+
+    def comparison_snapshot(self, specialty: str) -> Dict[str, Any]:
+        """Read a consistent live test bank without allocating IDs or changing runs."""
+        specialty = normalize_specialty(specialty)
+        with self.database() as db:
+            db.execute("BEGIN")
+            rows = db.execute(
+                """SELECT current.source_id, current.payload_json, current.last_seen_at
+                   FROM items current
+                   WHERE current.source_mode = 'live' AND current.specialty = ?
+                     AND current.kind = 'test' AND current.status = 'ready'
+                     AND current.version = (
+                       SELECT MAX(latest.version) FROM items latest
+                       WHERE latest.source_mode = current.source_mode
+                         AND latest.specialty = current.specialty
+                         AND latest.kind = current.kind
+                         AND latest.source_id = current.source_id)
+                   ORDER BY current.source_id""", (specialty,)
+            ).fetchall()
+            captured_at = utc_now()
+        return {"specialty": specialty, "captured_at": captured_at,
+                "items": [{"source_id": row["source_id"],
+                           "payload": json.loads(row["payload_json"]),
+                           "last_seen_at": row["last_seen_at"]} for row in rows]}
+
+    def export_bank_counts(self, specialty: str) -> Dict[str, int]:
+        """Match the current-bank Excel; leave collection/audit raw counts intact."""
+        from .comparison import test_identity
+        specialty = normalize_specialty(specialty)
+        with self.database() as db:
+            rows = db.execute("""SELECT i.kind,
+                CASE WHEN i.kind='test' THEN i.payload_json ELSE NULL END AS payload_json
+                FROM items i WHERE i.source_mode='live' AND i.specialty=?
+                AND i.status='ready' AND i.version=(SELECT MAX(j.version) FROM items j
+                WHERE j.source_mode=i.source_mode AND j.specialty=i.specialty
+                AND j.kind=i.kind AND j.source_id=i.source_id)""", (specialty,)).fetchall()
+        identities = {test_identity({'payload':json.loads(r['payload_json'])})
+                      for r in rows if r['kind']=='test'}
+        return {'test':len(identities),'case':sum(r['kind']=='case' for r in rows)}
 
     def catalog_counts(self, source_mode: str, specialty: str) -> Dict[str, int]:
         with self.database() as db:
@@ -707,6 +791,8 @@ class Storage:
         item: CollectedItem,
         attempt_number: int,
     ) -> Tuple[str, int]:
+        if (item.raw_payload or {}).get("_reh2"):
+            return self.reh2_store_item(run_id, source_mode, specialty, item, attempt_number)
         now = utc_now()
         status = payload_status(item.kind, item.payload)
         payload_json = json.dumps(item.payload, ensure_ascii=False)

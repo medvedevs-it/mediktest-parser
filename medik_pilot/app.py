@@ -5,7 +5,9 @@ import re
 from typing import Literal, Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
+from starlette.background import BackgroundTask
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field, model_validator
 
@@ -16,8 +18,10 @@ from .exporter import (
     export_json,
     export_tests_xlsx,
     export_xlsx,
+    export_current_bank_xlsx,
 )
-from .config import IMAGE_DIR
+from .config import DATA_DIR, IMAGE_DIR
+from .comparison import ComparisonManager, ComparisonError, MAX_BYTES
 from .images import IMAGE_EXTENSIONS, detect_image_type
 from .runner import RunManager
 from .specialties import DEFAULT_SPECIALTY, SUPPORTED_SPECIALTIES, normalize_specialty
@@ -26,13 +30,16 @@ from .storage import Storage
 
 storage = Storage()
 manager = RunManager(storage)
-app = FastAPI(title="Easy Station Collector", version="1.5.0")
+comparisons = ComparisonManager(storage, DATA_DIR / "comparisons")
+app = FastAPI(title="Easy Station Collector", version="1.6.1")
 INDEX_PATH = Path(__file__).resolve().parent / "web" / "index.html"
 BRAND_LOGO_PATH = INDEX_PATH.parent / "easy-station-logo.png"
 
 
 class RunRequest(BaseModel):
     source_mode: Literal["demo", "live"] = "live"
+    # Applies only to newly submitted runs; persisted legacy runs keep their source.
+    test_source: Literal["legacy", "reh2"] = "reh2"
     material_type: Literal["test", "case", "both"] = "both"
     specialty: str = DEFAULT_SPECIALTY
     document_mode: Literal["catalog", "new"] = "catalog"
@@ -80,6 +87,56 @@ class CredentialsRequest(BaseModel):
 class CatalogResetRequest(BaseModel):
     confirmation: Literal["RESET_ALL_MATERIALS", "RESET_SPECIALTY_MATERIALS"]
     specialty: Optional[str] = None
+
+
+class ComparisonStartRequest(BaseModel):
+    sheet: str = Field(min_length=1, max_length=31)
+    specialty: str = DEFAULT_SPECIALTY
+
+
+@app.get("/assets/comparison.js", include_in_schema=False)
+def comparison_script():
+    return FileResponse(INDEX_PATH.parent / "comparison.js", media_type="text/javascript",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/api/comparisons/uploads", status_code=202)
+async def comparison_upload(request: Request, filename: str = Query(max_length=255)):
+    content = bytearray()
+    async for chunk in request.stream():
+        if len(content) + len(chunk) > MAX_BYTES:
+            raise HTTPException(413, "Размер файла превышает 20 МБ.")
+        content.extend(chunk)
+    try:
+        return await run_in_threadpool(comparisons.upload, bytes(content), filename)
+    except ComparisonError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/comparisons/{identity}")
+def comparison_status(identity: str):
+    try:
+        return comparisons.get(identity)
+    except ComparisonError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/api/comparisons/{identity}/start", status_code=202)
+def comparison_start(identity: str, body: ComparisonStartRequest):
+    try:
+        return comparisons.start(identity, body.sheet, body.specialty)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/comparisons/{identity}/report.xlsx")
+def comparison_report(identity: str):
+    meta = comparison_status(identity)
+    if meta["status"] != "completed":
+        raise HTTPException(409, "Отчёт ещё не готов.")
+    return FileResponse(comparisons.directory(identity) / "report.xlsx",
+                        filename="Сравнение_{}_{}.xlsx".format(meta["specialty"], identity[:8]),
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -183,7 +240,7 @@ def catalog_counts(specialty: str = Query(DEFAULT_SPECIALTY, min_length=1)):
         canonical = normalize_specialty(specialty)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    counts = storage.catalog_counts("live", canonical)
+    counts = storage.export_bank_counts(canonical)
     return {
         "specialty": canonical,
         "test": int(counts.get("test", 0)),
@@ -307,6 +364,18 @@ def download_xlsx(run_id: str):
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+@app.get("/api/catalog/export.xlsx")
+def download_current_bank(specialty: str):
+    try:
+        specialty = normalize_specialty(specialty)
+        target = export_current_bank_xlsx(storage, specialty)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return FileResponse(target, filename="Банк_{}_{}.xlsx".format(specialty, datetime.now().strftime('%Y-%m-%d')),
+                        background=BackgroundTask(target.unlink, missing_ok=True),
+                        headers={'Cache-Control':'no-store'})
 
 
 @app.get("/api/runs/{run_id}/export.images.zip")

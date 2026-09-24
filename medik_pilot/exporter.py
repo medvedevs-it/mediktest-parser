@@ -63,7 +63,17 @@ def _export_rows(storage: Storage, run_id: str) -> tuple[Dict[str, Any], List[Di
         if run.get("document_mode", "catalog") == "new"
         else storage.catalog_rows_for_run(run_id)
     )
-    return run, rows
+    from .comparison import test_identity
+    seen = set()
+    selected = []
+    for row in rows:
+        if row['kind']=='test' and row.get('status')=='ready':
+            key=test_identity(row)
+            if key in seen:
+                continue
+            seen.add(key)
+        selected.append(row)
+    return run, selected
 
 
 def _image_manifest(rows: List[Dict[str, Any]], image_dir: Path = IMAGE_DIR) -> List[Dict[str, Any]]:
@@ -124,6 +134,7 @@ def export_json(storage: Storage, run_id: str) -> Path:
     image_assets = _image_manifest(ready_rows)
     target = EXPORT_DIR / "{}.json".format(run_id)
     safe_run_fields = {
+        "test_source",
         "source_mode", "material_type", "specialty", "document_mode", "document_name",
         "status", "stop_reason",
         "created_at", "started_at", "finished_at", "reference_tests", "reference_cases",
@@ -542,6 +553,8 @@ def _ready_rows(storage: Storage, run_id: str) -> tuple[Dict[str, Any], List[Dic
         else storage.catalog_rows_for_run(run_id)
     )
     tests_rows = [row for row in rows if row["kind"] == "test" and row.get("status") == "ready"]
+    from .comparison import unique_tests
+    tests_rows = unique_tests(tests_rows)
     case_rows = [row for row in rows if row["kind"] == "case" and row.get("status") == "ready"]
     return run, tests_rows, case_rows
 
@@ -710,6 +723,28 @@ def export_xlsx(storage: Storage, run_id: str) -> Path:
 
     target = EXPORT_DIR / "{}.xlsx".format(run_id)
     workbook.save(target)
+    return target
+
+
+def export_current_bank_xlsx(storage: Storage, specialty: str) -> Path:
+    """Export latest ready rows directly, independently of any historical run."""
+    import tempfile
+    from .comparison import unique_tests
+    rows = storage.current_bank_rows(specialty)
+    if not rows:
+        raise ValueError("Банк выбранной специальности пуст.")
+    workbook = Workbook()
+    _add_tests_sheet(workbook, storage, unique_tests([r for r in rows if r['kind']=='test']))
+    _add_case_sheets(workbook, storage, [r for r in rows if r['kind']=='case'])
+    with tempfile.NamedTemporaryFile(suffix='.xlsx', delete=False) as f:
+        target = Path(f.name)
+    try:
+        workbook.save(target)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    finally:
+        workbook.close()
     return target
 
 
