@@ -1,0 +1,6 @@
+# Build an amd64 application update on the exact image already used for deployment.
+# The digest pins the verified REH2 runtime and preserves its entrypoint/environment.
+FROM medvedevs/medictest-parser:reh2-20260924-6ecc36086378@sha256:bb4d4fc0131b37ae02af2f3325ebeb6205fd96e6e388273c980e8c843dcdf544
+
+WORKDIR /app
+COPY medik_pilot/ /app/medik_pilot/
