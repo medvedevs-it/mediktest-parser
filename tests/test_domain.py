@@ -27,6 +27,8 @@ from medik_pilot.exporter import (
     export_json,
     export_tests_xlsx,
     export_xlsx,
+    export_current_bank_xlsx,
+    export_current_bank_images_zip,
 )
 from medik_pilot.images import (
     client_image_filename,
@@ -36,7 +38,10 @@ from medik_pilot.images import (
 from medik_pilot.runner import RunManager
 from medik_pilot.specialties import SUPPORTED_SPECIALTIES, normalize_specialty, package_title
 from medik_pilot.storage import Storage, utc_now
-from medik_pilot.app import RunRequest, app, catalog_counts, create_run, public_image
+from medik_pilot.app import (
+    RunRequest, app, catalog_counts, create_run, public_image,
+    download_current_bank_images,
+)
 from fastapi import HTTPException
 from pydantic import ValidationError
 
@@ -1070,6 +1075,120 @@ class StorageTests(unittest.TestCase):
             manifest = json.loads(archive.read("image_manifest.json"))
             self.assertEqual(manifest["image_count"], 1)
 
+    def test_current_bank_image_zip_spans_runs_and_scopes_specialty(self):
+        image_dir = Path(self.temp.name) / "bank-images"
+        image_dir.mkdir()
+        from hashlib import sha256
+        image_bytes = b"\x89PNG\r\n\x1a\nimage-content"
+        image_digest = sha256(image_bytes).hexdigest()
+
+        def add_case(run_id, specialty, source_id, asset):
+            config = dict(
+                self.config, source_mode="live", specialty=specialty,
+                material_type="case", reference_tests=0, reference_cases=1,
+            )
+            self.storage.create_run(run_id, config)
+            payload = DemoCollector(specialty=specialty).collect_attempt("case", 1)[0].payload
+            payload["condition_sections"] = [{
+                "title": "Ситуация", "text": "Ситуация для {}".format(source_id),
+                "images": [asset],
+            }]
+            self.storage.store_item(
+                run_id, "live", specialty, CollectedItem("case", source_id, payload), 1
+            )
+
+        image = {
+            "asset_kind": "image", "filename": "same.png",
+            "storage_name": image_digest + ".png", "sha256": image_digest,
+            "content_type": "image/png", "size": len(image_bytes),
+            "source_url": "https://example.test/same.png", "downloaded": True,
+        }
+        missing = dict(image, filename="missing.png", storage_name="missing.png", sha256="b" * 64)
+        remote = dict(image, filename="remote.png", storage_name="", downloaded=False, sha256="c" * 64)
+        (image_dir / image["storage_name"]).write_bytes(image_bytes)
+        add_case("live-old", "Лечебное дело", "general-old", image)
+        add_case("live-copy", "Лечебное дело", "general-copy", image)
+        add_case("live-missing", "Лечебное дело", "general-missing", missing)
+        add_case("live-remote", "Лечебное дело", "general-remote", remote)
+        pediatric = dict(image, filename="pediatrics.png", storage_name="d" * 64 + ".png", sha256="d" * 64)
+        (image_dir / pediatric["storage_name"]).write_bytes(b"pediatric")
+        add_case("live-pediatrics", "Педиатрия", "pediatrics-case", pediatric)
+
+        archive_path = export_current_bank_images_zip(self.storage, " лечебное дело ", image_dir=image_dir)
+        self.addCleanup(archive_path.unlink, missing_ok=True)
+        with zipfile.ZipFile(archive_path) as archive:
+            self.assertEqual(archive.read("images/same.png"), image_bytes)
+            self.assertNotIn("images/pediatrics.png", archive.namelist())
+            manifest = json.loads(archive.read("image_manifest.json"))
+        self.assertEqual(manifest["specialty"], "Лечебное дело")
+        self.assertEqual(manifest["scope"], "current_bank")
+        self.assertEqual(manifest["case_count"], 4)
+        self.assertEqual(manifest["image_count"], 1)
+        self.assertCountEqual(
+            [entry["reason"] for entry in manifest["unavailable_images"]],
+            ["image_file_missing", "image_not_downloaded"],
+        )
+        self.assertEqual(manifest["images"][0]["case_source_ids"], ["general-copy", "general-old"])
+        self.assertNotIn("source_url", manifest["images"][0])
+
+        with patch("medik_pilot.exporter.IMAGE_DIR", image_dir):
+            workbook_path = export_current_bank_xlsx(self.storage, "Лечебное дело")
+        from openpyxl import load_workbook
+        workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+        try:
+            linked_condition = next(
+                value for (value,) in workbook["exercise_rows"].iter_rows(
+                    min_row=2, min_col=3, max_col=3, values_only=True
+                ) if isinstance(value, str) and "same.png" in value
+            )
+        finally:
+            workbook.close()
+            workbook_path.unlink(missing_ok=True)
+        self.assertIn(manifest["images"][0]["public_url"], linked_condition)
+
+    def test_current_bank_image_zip_empty_bank_case_without_image_and_collision(self):
+        image_dir = Path(self.temp.name) / "empty-images"
+        image_dir.mkdir()
+        empty_path = export_current_bank_images_zip(self.storage, "Лечебное дело", image_dir=image_dir)
+        self.addCleanup(empty_path.unlink, missing_ok=True)
+        with zipfile.ZipFile(empty_path) as archive:
+            empty_manifest = json.loads(archive.read("image_manifest.json"))
+        self.assertEqual(empty_manifest["case_count"], 0)
+        self.assertEqual(empty_manifest["image_count"], 0)
+        self.assertEqual(empty_manifest["unavailable_count"], 0)
+
+        config = dict(self.config, source_mode="live", material_type="case", reference_tests=0, reference_cases=1)
+        self.storage.create_run("case-without-images", config)
+        item = DemoCollector().collect_attempt("case", 1)[0]
+        self.storage.store_item(
+            "case-without-images", "live", "Лечебное дело",
+            CollectedItem("case", "case-without-images", item.payload), 1,
+        )
+        no_image_path = export_current_bank_images_zip(self.storage, "Лечебное дело", image_dir=image_dir)
+        self.addCleanup(no_image_path.unlink, missing_ok=True)
+        with zipfile.ZipFile(no_image_path) as archive:
+            no_image_manifest = json.loads(archive.read("image_manifest.json"))
+        self.assertEqual(no_image_manifest["cases_without_images"], 1)
+        self.assertEqual(no_image_manifest["image_count"], 0)
+
+        def add_conflicting_case(run_id, source_id, digest, body):
+            config = dict(self.config, source_mode="live", material_type="case", reference_tests=0, reference_cases=1)
+            self.storage.create_run(run_id, config)
+            payload = DemoCollector().collect_attempt("case", 1)[0].payload
+            payload["information_blocks"] = [{"images": [{
+                "asset_kind": "image", "filename": "collision.png",
+                "storage_name": digest + ".png", "sha256": digest, "downloaded": True,
+            }]}]
+            self.storage.store_item(
+                run_id, "live", "Лечебное дело", CollectedItem("case", source_id, payload), 1
+            )
+            (image_dir / (digest + ".png")).write_bytes(body)
+
+        add_conflicting_case("collision-1", "collision-1", "a" * 64, b"first")
+        add_conflicting_case("collision-2", "collision-2", "b" * 64, b"second")
+        with self.assertRaisesRegex(ValueError, "разные файлы"):
+            export_current_bank_images_zip(self.storage, "Лечебное дело", image_dir=image_dir)
+
     def test_case_export_writes_confirmed_diagnosis_to_exercise_header(self):
         item = CollectedItem(
             "case",
@@ -1157,6 +1276,27 @@ class PilotFlowTests(unittest.TestCase):
         self.assertIn("/api/runs/{run_id}/export.cases.xlsx", paths)
         self.assertIn("/assets/mediktest-logo.png", paths)
         self.assertIn("/api/catalog/reset", paths)
+        self.assertIn("/api/catalog/export.images.zip", paths)
+
+    def test_current_bank_image_export_endpoint_and_button_use_specialty(self):
+        target = Path(tempfile.gettempdir()) / "bank-images-test.zip"
+        target.write_bytes(b"zip")
+        self.addCleanup(target.unlink, missing_ok=True)
+        with patch("medik_pilot.app.storage") as mocked_storage, \
+                patch("medik_pilot.app.export_current_bank_images_zip", return_value=target) as export:
+            response = download_current_bank_images(" педиатрия ")
+        export.assert_called_once_with(mocked_storage, "Педиатрия")
+        self.assertEqual(response.media_type, "application/zip")
+        self.assertIn("Банк_Педиатрия_изображения_", response.filename)
+        with self.assertRaises(HTTPException) as invalid_specialty:
+            download_current_bank_images("Стоматология")
+        self.assertEqual(invalid_specialty.exception.status_code, 422)
+
+        html = (Path(__file__).parents[1] / "medik_pilot" / "web" / "index.html").read_text()
+        self.assertIn("downloadSelectedBankImages", html)
+        self.assertIn("Скачать изображения всех задач · ZIP", html)
+        self.assertIn("const specialty=resetSelect.value", html)
+        self.assertIn("/api/catalog/export.images.zip?specialty=", html)
 
     def test_transient_outer_cycle_error_does_not_fail_full_run(self):
         ready_item = CollectedItem(

@@ -172,6 +172,20 @@ if(resetButton){
     }catch(e){alert(e.message)}finally{downloadBank.disabled=false;downloadBank.textContent='Скачать выбранный банк · Excel'}
   };
   resetWrap.insertBefore(downloadBank,resetButton);
+  const downloadBankImages=document.createElement('button');
+  downloadBankImages.className='secondary';downloadBankImages.id='downloadSelectedBankImages';
+  downloadBankImages.style.marginBottom='12px';downloadBankImages.style.width='100%';
+  downloadBankImages.textContent='Скачать изображения всех задач · ZIP';
+  downloadBankImages.onclick=async()=>{
+    const specialty=resetSelect.value;downloadBankImages.disabled=true;downloadBankImages.textContent='Готовим изображения «'+specialty+'»…';
+    try{
+      const response=await fetch('/api/catalog/export.images.zip?specialty='+encodeURIComponent(specialty));
+      if(!response.ok){const error=await response.json();throw new Error(error.detail||'Ошибка выгрузки')}
+      const url=URL.createObjectURL(await response.blob()),a=document.createElement('a');
+      a.href=url;a.download='Банк_'+specialty+'_изображения.zip';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);
+    }catch(e){alert(e.message)}finally{downloadBankImages.disabled=false;downloadBankImages.textContent='Скачать изображения всех задач · ZIP'}
+  };
+  resetWrap.insertBefore(downloadBankImages,resetButton);
   resetSelect.value=$('specialty')?.value||'Лечебное дело';
   resetSelect.onchange=()=>syncSelectedBank(resetSelect.value);
   resetButton.textContent='Сбросить выбранный банк';
