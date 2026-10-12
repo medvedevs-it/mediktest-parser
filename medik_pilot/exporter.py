@@ -1,5 +1,6 @@
 import json
 import re
+import tempfile
 import zipfile
 from collections import defaultdict
 from datetime import datetime
@@ -13,6 +14,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from .config import EXPORT_DIR, IMAGE_DIR, ensure_directories, public_base_url
 from .domain import extract_case_diagnosis, normalize_question_text, normalize_text
 from .images import filename_for_image_content, iter_image_assets
+from .specialties import normalize_specialty
 from .storage import Storage
 
 
@@ -76,20 +78,35 @@ def _export_rows(storage: Storage, run_id: str) -> tuple[Dict[str, Any], List[Di
     return run, selected
 
 
-def _image_manifest(rows: List[Dict[str, Any]], image_dir: Path = IMAGE_DIR) -> List[Dict[str, Any]]:
+def _image_manifest_details(
+    rows: List[Dict[str, Any]], image_dir: Path = IMAGE_DIR
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     by_filename: Dict[str, Dict[str, Any]] = {}
     case_ids: Dict[str, set[str]] = defaultdict(set)
+    unavailable: List[Dict[str, Any]] = []
     for row in rows:
         if row.get("kind") != "case" or row.get("status") != "ready":
             continue
         for asset in iter_image_assets(row.get("payload") or {}):
+            filename = str(asset.get("filename") or "").strip()
+            case_source_id = str(row.get("source_id") or "")
             if asset.get("downloaded") is not True:
+                unavailable.append({
+                    "filename": filename or None,
+                    "case_source_id": case_source_id,
+                    "reason": "image_not_downloaded",
+                })
                 continue
             asset = _normalized_image_asset(asset, image_dir)
             filename = str(asset.get("filename") or "").strip()
             storage_name = str(asset.get("storage_name") or "").strip()
             digest = str(asset.get("sha256") or "").strip()
             if not filename or not storage_name:
+                unavailable.append({
+                    "filename": filename or None,
+                    "case_source_id": case_source_id,
+                    "reason": "image_metadata_incomplete",
+                })
                 continue
             previous = by_filename.get(filename)
             if previous and previous.get("sha256") != digest:
@@ -99,6 +116,11 @@ def _image_manifest(rows: List[Dict[str, Any]], image_dir: Path = IMAGE_DIR) -> 
                 )
             source_path = Path(image_dir) / storage_name
             if not source_path.is_file():
+                unavailable.append({
+                    "filename": filename,
+                    "case_source_id": case_source_id,
+                    "reason": "image_file_missing",
+                })
                 continue
             by_filename[filename] = {
                 "filename": filename,
@@ -109,14 +131,18 @@ def _image_manifest(rows: List[Dict[str, Any]], image_dir: Path = IMAGE_DIR) -> 
                 "source_url": asset.get("source_url") or "",
                 "source_path": source_path,
             }
-            case_ids[filename].add(str(row.get("source_id") or ""))
+            case_ids[filename].add(case_source_id)
     result = []
     for filename in sorted(by_filename, key=str.casefold):
         item = by_filename[filename]
         item["case_source_ids"] = sorted(case_ids[filename])
         item["public_url"] = _public_image_url(item)
         result.append(item)
-    return result
+    return result, unavailable
+
+
+def _image_manifest(rows: List[Dict[str, Any]], image_dir: Path = IMAGE_DIR) -> List[Dict[str, Any]]:
+    return _image_manifest_details(rows, image_dir)[0]
 
 
 def export_json(storage: Storage, run_id: str) -> Path:
@@ -774,6 +800,57 @@ def export_images_zip(storage: Storage, run_id: str, image_dir: Path = IMAGE_DIR
             "image_manifest.json",
             json.dumps(manifest, ensure_ascii=False, indent=2),
         )
+    return target
+
+
+def export_current_bank_images_zip(
+    storage: Storage, specialty: str, image_dir: Path = IMAGE_DIR
+) -> Path:
+    """Export stored images referenced by every current ready case in a specialty."""
+    ensure_directories()
+    specialty = normalize_specialty(specialty)
+    rows = storage.current_bank_rows(specialty)
+    cases = [row for row in rows if row.get("kind") == "case" and row.get("status") == "ready"]
+    assets, unavailable = _image_manifest_details(cases, Path(image_dir))
+    target_handle = tempfile.NamedTemporaryFile(suffix="-images.zip", dir=EXPORT_DIR, delete=False)
+    target = Path(target_handle.name)
+    target_handle.close()
+    manifest = {
+        "scope": "current_bank",
+        "specialty": specialty,
+        "case_count": len(cases),
+        "directory": "images",
+        "image_count": 0,
+        "unavailable_count": len(unavailable),
+        "cases_without_images": sum(
+            not list(iter_image_assets(row.get("payload") or {})) for row in cases
+        ),
+        "images": [],
+        "unavailable_images": unavailable,
+    }
+    try:
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for asset in assets:
+                try:
+                    image_bytes = Path(asset["source_path"]).read_bytes()
+                except OSError:
+                    manifest["unavailable_images"].append({
+                        "filename": asset["filename"],
+                        "case_source_ids": asset["case_source_ids"],
+                        "reason": "image_file_unreadable",
+                    })
+                    continue
+                archive.writestr("images/{}".format(asset["filename"]), image_bytes)
+                manifest["image_count"] += 1
+                manifest["images"].append({
+                    key: value for key, value in asset.items()
+                    if key not in {"source_path", "storage_name", "source_url"}
+                })
+            manifest["unavailable_count"] = len(manifest["unavailable_images"])
+            archive.writestr("image_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
     return target
 
 

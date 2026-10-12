@@ -19,6 +19,7 @@ from .exporter import (
     export_tests_xlsx,
     export_xlsx,
     export_current_bank_xlsx,
+    export_current_bank_images_zip,
 )
 from .config import DATA_DIR, IMAGE_DIR
 from .comparison import ComparisonManager, ComparisonError, MAX_BYTES
@@ -376,6 +377,27 @@ def download_current_bank(specialty: str):
     return FileResponse(target, filename="Банк_{}_{}.xlsx".format(specialty, datetime.now().strftime('%Y-%m-%d')),
                         background=BackgroundTask(target.unlink, missing_ok=True),
                         headers={'Cache-Control':'no-store'})
+
+
+@app.get("/api/catalog/export.images.zip")
+def download_current_bank_images(specialty: str):
+    try:
+        specialty = normalize_specialty(specialty)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        target = export_current_bank_images_zip(storage, specialty)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return FileResponse(
+        target,
+        filename="Банк_{}_изображения_{}.zip".format(
+            specialty, datetime.now().strftime('%Y-%m-%d')
+        ),
+        media_type="application/zip",
+        background=BackgroundTask(target.unlink, missing_ok=True),
+        headers={'Cache-Control': 'no-store'},
+    )
 
 
 @app.get("/api/runs/{run_id}/export.images.zip")
