@@ -211,3 +211,27 @@ def normalize_value(value: Any) -> Any:
             if key not in {"collected_at", "attempt_id", "position", "error"}
         }
     return value
+
+
+def case_content_identity(payload: Dict[str, Any]) -> str:
+    """Identify complete cases conservatively, ignoring only run metadata and answer order."""
+    def normalize_case_value(value: Any) -> Any:
+        if isinstance(value, str):
+            text = normalize_text(value)
+            if re.search(r"<\s*(?:img|svg|picture|source|video|audio)\b", html.unescape(value), re.IGNORECASE):
+                return {"normalized_text": text, "raw_media_markup": value}
+            return text
+        if isinstance(value, list):
+            return [normalize_case_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: normalize_case_value(item) for key, item in sorted(value.items())}
+        return value
+
+    normalized = normalize_case_value(payload)
+    for key in ("synthetic", "sampled_questions", "expected_questions", "collected_at", "attempt_id"):
+        normalized.pop(key, None)
+    for question in normalized.get("questions") or []:
+        if isinstance(question, dict) and isinstance(question.get("options"), list):
+            question["options"] = sorted(question["options"], key=lambda option: json.dumps(option, ensure_ascii=False, sort_keys=True))
+    encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()

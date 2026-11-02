@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .config import DB_PATH, ensure_directories
-from .domain import CollectedItem, payload_status
+from .domain import CollectedItem, case_content_identity, normalize_text, payload_status
 from .images import iter_image_assets
 from .specialties import normalize_specialty
 from .reh2_storage import Reh2StorageMixin
@@ -798,22 +798,44 @@ class Storage(Reh2StorageMixin):
         payload_json = json.dumps(item.payload, ensure_ascii=False)
         raw_payload_json = json.dumps(item.raw_payload or item.payload, ensure_ascii=False)
         with self._lock, self.database() as db:
+            if item.kind == "case" and status == "ready":
+                db.execute("BEGIN IMMEDIATE")
             previous = db.execute(
                 """SELECT * FROM items
                    WHERE source_mode = ? AND specialty = ? AND kind = ? AND source_id = ?
                    ORDER BY version DESC LIMIT 1""",
                 (source_mode, specialty, item.kind, item.source_id),
             ).fetchone()
-            if previous and previous["content_hash"] == item.content_hash:
+            case_identity = case_content_identity(item.payload) if item.kind == "case" and status == "ready" else None
+            same_previous_case = bool(previous and case_identity and previous["status"] == "ready" and case_content_identity(json.loads(previous["payload_json"])) == case_identity)
+            previous_is_duplicate = same_previous_case if case_identity else bool(previous and previous["content_hash"] == item.content_hash)
+            if previous and previous_is_duplicate:
                 outcome, item_id = "duplicate", previous["id"]
                 db.execute("UPDATE items SET last_seen_at = ? WHERE id = ?", (now, item_id))
             elif not previous:
-                same_content = db.execute(
+                same_content = None if case_identity else db.execute(
                     """SELECT * FROM items
                        WHERE source_mode = ? AND specialty = ? AND kind = ? AND content_hash = ?
                        ORDER BY last_seen_at DESC LIMIT 1""",
                     (source_mode, specialty, item.kind, item.content_hash),
                 ).fetchone()
+                if not same_content and case_identity:
+                    db.create_function("normalized_case_condition", 1, lambda value: normalize_text(value) if isinstance(value, str) else "", deterministic=True)
+                    candidates = db.execute(
+                        """SELECT current.id, current.payload_json FROM items current
+                           WHERE current.source_mode = ? AND current.specialty = ?
+                             AND current.kind = 'case' AND current.status = 'ready'
+                             AND normalized_case_condition(json_extract(current.payload_json, '$.condition')) = ?
+                             AND current.version = (
+                               SELECT MAX(latest.version) FROM items latest
+                               WHERE latest.source_mode = current.source_mode
+                                 AND latest.specialty = current.specialty
+                                 AND latest.kind = current.kind
+                                 AND latest.source_id = current.source_id)
+                           ORDER BY current.id""",
+                        (source_mode, specialty, normalize_text(item.payload.get("condition") or "")),
+                    )
+                    same_content = next((row for row in candidates if case_content_identity(json.loads(row["payload_json"])) == case_identity), None)
                 if same_content:
                     outcome, item_id = "duplicate", same_content["id"]
                     db.execute("UPDATE items SET last_seen_at = ? WHERE id = ?", (now, item_id))

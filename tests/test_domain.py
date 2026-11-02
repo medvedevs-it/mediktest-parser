@@ -884,6 +884,79 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(self.storage.store_item("run-1", "demo", "Лечебное дело", second, 2)[0], "duplicate")
         self.assertEqual(len(self.storage.export_rows("run-1")), 1)
 
+    def test_ready_case_deduplicates_answer_order_and_demo_flag_without_losing_changes(self):
+        import copy
+        config = dict(self.config, source_mode="live", material_type="case", reference_cases=5)
+        self.storage.create_run("live-cases", config)
+        payload = DemoCollector(specialty="Лечебное дело").collect_attempt("case", 1)[0].payload
+        def save(source, body, specialty="Лечебное дело"):
+            return self.storage.store_item("live-cases", "live", specialty, CollectedItem("case", source, body), 1)[0]
+        self.assertEqual(save("case-a", payload), "new")
+        reordered = copy.deepcopy(payload)
+        reordered["synthetic"] = not bool(payload.get("synthetic"))
+        reordered["sampled_questions"] = 999
+        reordered["expected_questions"] = 1
+        reordered["condition"] += "  "
+        reordered["questions"][0]["options"].reverse()
+        self.assertEqual(save("case-b", reordered), "duplicate")
+        self.assertEqual(save("case-a", reordered), "duplicate")
+        changed_question = copy.deepcopy(payload)
+        changed_question["questions"][0]["question"] += " изменён"
+        self.assertEqual(save("case-c", changed_question), "new")
+        changed_answer = copy.deepcopy(payload)
+        options = changed_answer["questions"][0]["options"]
+        options[0]["is_correct"], options[1]["is_correct"] = options[1]["is_correct"], options[0]["is_correct"]
+        self.assertEqual(save("case-d", changed_answer), "new")
+        changed_image = copy.deepcopy(payload)
+        changed_image["condition_sections"] = [{"title": "Ситуация", "text": "Текст", "images": [{"sha256": "other-image"}]}]
+        self.assertEqual(save("case-e", changed_image), "new")
+        self.assertEqual(save("case-f", payload, "Педиатрия"), "new")
+        self.assertEqual(self.storage.export_bank_counts("Лечебное дело")["case"], 4)
+
+    def test_case_deduplication_is_atomic_across_storage_instances(self):
+        import copy
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        config = dict(self.config, source_mode="live", material_type="case", reference_cases=10)
+        self.storage.create_run("race-cases", config)
+        other = Storage(self.storage.path)
+        original = DemoCollector(specialty="Лечебное дело").collect_attempt("case", 1)[0].payload
+        for index in range(10):
+            first = copy.deepcopy(original)
+            first["questions"][0]["question"] += " {}".format(index)
+            second = copy.deepcopy(first)
+            second["questions"][0]["options"].reverse()
+            barrier = threading.Barrier(2)
+            def save(storage, source, payload):
+                barrier.wait(timeout=10)
+                return storage.store_item("race-cases", "live", "Лечебное дело", CollectedItem("case", source, payload), 1)[0]
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                left = executor.submit(save, self.storage, "left-{}".format(index), first)
+                right = executor.submit(save, other, "right-{}".format(index), second)
+                self.assertCountEqual([left.result(), right.result()], ["new", "duplicate"])
+        self.assertEqual(self.storage.export_bank_counts("Лечебное дело")["case"], 10)
+
+    def test_case_deduplication_preserves_media_markup_and_nested_positions(self):
+        import copy
+        config = dict(self.config, source_mode="live", material_type="case", reference_cases=5)
+        self.storage.create_run("media-cases", config)
+        payload = DemoCollector(specialty="Лечебное дело").collect_attempt("case", 1)[0].payload
+        def save(source, body):
+            return self.storage.store_item("media-cases", "live", "Лечебное дело", CollectedItem("case", source, body), 1)[0]
+        first = copy.deepcopy(payload)
+        first["condition"] += '<img src="first.png">'
+        second = copy.deepcopy(payload)
+        second["condition"] += '<img src="second.png">'
+        self.assertEqual(save("first-image", first), "new")
+        self.assertEqual(save("second-image", second), "new")
+        positioned = copy.deepcopy(payload)
+        positioned["questions"][0]["position"] = 1
+        moved = copy.deepcopy(positioned)
+        moved["questions"][0]["position"] = 2
+        self.assertEqual(save("position-one", positioned), "new")
+        self.assertEqual(save("position-two", moved), "new")
+
     def test_client_ids_are_stable(self):
         first = self.storage.client_entity_id("demo", "Лечебное дело", "case_question", "case-1:q1", 600000)
         repeated = self.storage.client_entity_id("demo", "Лечебное дело", "case_question", "case-1:q1", 600000)
