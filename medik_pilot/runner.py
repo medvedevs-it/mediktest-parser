@@ -500,7 +500,11 @@ class RunManager:
                         )
                         if outcome == "replayed":
                             continue
-                        stored = self.storage.stored_item(item_id) if whole_package else None
+                        # A case returned under a new attempt ID may already
+                        # belong to an existing bank record. Count that saved
+                        # identity, as resume/progress/export do, not the
+                        # external attempt ID.
+                        stored = self.storage.stored_item(item_id) if whole_package or kind == "case" else None
                         ready = stored["status"] == "ready" if stored else payload_status(item.kind, item.payload) == "ready"
                         counts[outcome] += 1
                         totals[outcome] += 1
@@ -512,7 +516,7 @@ class RunManager:
                                 self.storage.catalog_counts(config["source_mode"], config["specialty"])
                             )
                         if ready:
-                            key = test_identity({'payload':stored['payload'] if stored else item.payload}) if kind == 'test' else item.source_id
+                            key = test_identity({'payload':stored['payload'] if stored else item.payload}) if kind == 'test' else stored['source_id']
                             run_seen_ids.setdefault(kind, set()).add(key)
                             run_counts[kind] = len(run_seen_ids[kind])
                         if outcome == "new":
