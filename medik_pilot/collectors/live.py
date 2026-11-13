@@ -822,6 +822,17 @@ class LiveSelftestCollector:
                 const target = id ? document.getElementById(id) : null;
                 const images = [];
                 const contentBlocks = [];
+                // Keep mathematical notation before any innerText conversion.
+                const mathText = node => {
+                    const copy = node.cloneNode(true);
+                    for (const el of copy.querySelectorAll('sup, sub')) {
+                        const from = '0123456789+-=()';
+                        const to = el.tagName === 'SUP' ? '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾' : '₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎';
+                        el.replaceWith(Array.from(el.textContent).map(c => from.includes(c) ? to[from.indexOf(c)] : c).join(''));
+                    }
+                    for (const br of copy.querySelectorAll('br')) br.replaceWith(' ');
+                    return copy.textContent || '';
+                };
                 let textParts = [];
                 const ignoredTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
                 const blockTags = new Set([
@@ -844,6 +855,12 @@ class LiveSelftestCollector:
                         return;
                     }
                     if (node.nodeType !== Node.ELEMENT_NODE || ignoredTags.has(node.tagName)) return;
+                    if (node.tagName === 'SUP' || node.tagName === 'SUB') {
+                        const wrapper = document.createElement('span');
+                        wrapper.appendChild(node.cloneNode(true));
+                        textParts.push(mathText(wrapper));
+                        return;
+                    }
                     if (node.tagName === 'BR') {
                         textParts.push(' ');
                         return;
@@ -865,7 +882,7 @@ class LiveSelftestCollector:
                     if (node.tagName === 'TABLE') {
                         flushText();
                         const rows = Array.from(node.rows || []).map(row =>
-                            Array.from(row.cells || []).map(cell => (cell.innerText || cell.textContent || '').trim())
+                            Array.from(row.cells || []).map(cell => mathText(cell).trim())
                         ).filter(row => row.some(cell => cell));
                         if (rows.length) contentBlocks.push({type: 'table', rows});
                         return;
@@ -881,7 +898,7 @@ class LiveSelftestCollector:
                 }
                 return {
                     title: (link.innerText || '').trim(),
-                    text: target ? (target.innerText || '').trim() : '',
+                    text: target ? mathText(target).trim() : '',
                     html: target ? (target.innerHTML || '').trim() : '',
                     images,
                     content_blocks: contentBlocks,
@@ -1094,9 +1111,7 @@ class LiveSelftestCollector:
             labels = self._page.locator(".custom-control-label")
             if labels.count() < 1:
                 raise RuntimeError("В кейсе не найден вариант ответа для вопроса {}.".format(question_number))
-            body_text = self._page.locator("body").inner_text()
-            first_option = normalize_text(labels.first.inner_text())
-            question_text = self._extract_case_question(body_text, first_option)
+            question_text = normalize_question_text(self._case_question_html())
             input_types = self._page.locator(".custom-control-input").evaluate_all(
                 "(nodes) => nodes.map(node => (node.type || '').toLowerCase())"
             )
@@ -1116,7 +1131,8 @@ class LiveSelftestCollector:
                 for option_index in range(inputs.count()):
                     should_be_checked = option_index < required
                     if inputs.nth(option_index).is_checked() != should_be_checked:
-                        labels.nth(option_index).click(force=True)
+                        labels.nth(option_index).click()
+                self._wait_for_case_answer_selection(required)
             is_last_question = index + 1 >= len(question_numbers)
             if is_last_question:
                 finish_button = self._first_visible(
@@ -1161,8 +1177,9 @@ class LiveSelftestCollector:
                         "После выбора ответа не найден видимый переход «Далее» "
                         "для вопроса {}.".format(question_number)
                     )
-                next_button.click(force=True)
+                next_button.click()
                 self._page.wait_for_timeout(1800)
+                self._check_case_answer_dialog(required, next_button)
         result_button = self._first_visible(
             [
                 self._page.get_by_role("button", name="Результат", exact=True),
@@ -1173,6 +1190,51 @@ class LiveSelftestCollector:
         if result_button is not None:
             result_button.click(force=True)
             self._page.wait_for_timeout(3000)
+
+    def _wait_for_case_answer_selection(self, required: int) -> None:
+        self._page.wait_for_function(
+            "n => document.querySelectorAll('.custom-control-input:checked').length === n",
+            arg=required, timeout=10000,
+        )
+        # The trainer validates Vue state, not only the browser's checked
+        # property. Allow its queued render/update to commit before Next.
+        self._page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))")
+
+    def _check_case_answer_dialog(self, required: int, next_button) -> None:
+        dialogs = self._page.locator('[role="dialog"]:visible')
+        if not dialogs.count():
+            return
+        if dialogs.count() != 1:
+            raise RuntimeError("Несколько окон тренажёра перекрывают вопрос кейса.")
+        dialog = dialogs.first
+        text = normalize_text(dialog.inner_text())
+        # Normal case workflow reveals investigation results after an answer.
+        # Acknowledge only this observed informational popup; Next has already
+        # been submitted, so do not submit it again.
+        if text.startswith('Доступны новые данные ×'):
+            close = dialog.locator('button').filter(has_text=re.compile(r'^\s*×\s*$'))
+            if close.count() != 1:
+                raise RuntimeError("Не найдена кнопка закрытия новых данных кейса.")
+            close.click()
+            dialog.wait_for(state='hidden', timeout=10000)
+            return
+        counts = re.search(
+            r"необходимо выбрать (\d+) вариантов ответа\. Выбрано вариантов ответа: (\d+)", text
+        )
+        # A reproduced transient validation popup reports equal counts after
+        # the reactive state catches up. Never dismiss other warnings or limits.
+        if not text.startswith('Неверное количество вариантов ответа') or not counts or tuple(map(int, counts.groups())) != (required, required):
+            raise RuntimeError("Тренажёр отклонил выбор ответов: " + text)
+        close = dialog.locator('button').filter(has_text=re.compile(r'^\s*×\s*$'))
+        if close.count() != 1:
+            raise RuntimeError("Не найдена однозначная кнопка закрытия сообщения о количестве ответов.")
+        close.click()
+        dialog.wait_for(state='hidden', timeout=10000)
+        self._wait_for_case_answer_selection(required)
+        next_button.click()
+        self._page.wait_for_timeout(1800)
+        if self._page.locator('[role="dialog"]:visible').count():
+            raise RuntimeError("Повторное отклонение ответов тренажёром; сбор остановлен.")
 
     @staticmethod
     def _required_case_answer_count(
@@ -1201,29 +1263,60 @@ class LiveSelftestCollector:
 
     def _open_case_question(self, question_number: int) -> None:
         """Open a numbered case question without selecting an answer."""
-        button = self._page.get_by_role("button", name=str(question_number), exact=True)
+        dialogs = self._page.locator('[role="dialog"]:visible')
+        if dialogs.count():
+            text = normalize_text(dialogs.first.inner_text())
+            if dialogs.count() != 1 or not re.fullmatch(
+                r'Результаты решения задачи × Вы ответили верно на \d+ вопрос(?:а|ов)? из \d+\.', text
+            ):
+                raise RuntimeError("Окно тренажёра требует проверки: " + text)
+            close = dialogs.first.locator('button').filter(has_text=re.compile(r'^\s*×\s*$'))
+            if close.count() != 1:
+                raise RuntimeError("Не найдена кнопка закрытия результатов кейса.")
+            close.click()
+            dialogs.first.wait_for(state='hidden', timeout=10000)
+        button = self._page.locator('nav[aria-label="Список вопросов"] a.page-link').filter(
+            has_text=re.compile(r"^\s*{}\s*$".format(question_number))
+        )
         if button.count() != 1:
-            button = self._page.locator("button").filter(has_text=re.compile(r"^\s*{}\s*$".format(question_number)))
-        if button.count() == 0:
-            button = self._page.get_by_text(str(question_number), exact=True)
-        if button.count() == 0:
             raise RuntimeError("Не удалось найти кнопку вопроса {} кейса.".format(question_number))
-        # The site wraps pagination anchors in a temporarily disabled <li>
-        # while the question panel is settling; force the DOM click after the
-        # visible anchor has been found so we don't select an answer.
-        button.last.click(force=True)
-        self._page.wait_for_timeout(1200)
+        # Do not click arbitrary matching text or force a disabled pagination
+        # item: either can leave the previous question in the export.
+        button.click(timeout=30000)
+        self._page.wait_for_function(
+            """number => {
+                const active = document.querySelector('nav[aria-label="Список вопросов"] li.active a.page-link');
+                return active && active.textContent.trim() === String(number)
+                    && document.querySelector('h5.adoc')
+                    && document.querySelectorAll('.custom-control-label').length >= 2;
+            }""", arg=question_number, timeout=30000,
+        )
+
+    def _case_question_html(self) -> str:
+        # The heading is in the same question panel as the answer controls,
+        # not in the condition tabs (where option text often occurs as well).
+        panel = self._page.locator('.custom-control-label').first.locator(
+            'xpath=ancestor::div[.//h5[contains(@class,"adoc")]][1]'
+        )
+        heading = panel.locator('h5.adoc')
+        if heading.count() != 1:
+            raise RuntimeError("Не найден однозначный текст вопроса кейса.")
+        return heading.inner_html()
 
     def _read_case_question(self, question_number: int) -> Dict:
-        body_text = self._page.locator("body").inner_text()
         option_locator = self._page.locator(".custom-control-label")
         options = [normalize_text(value) for value in option_locator.all_inner_texts() if normalize_text(value)]
         if len(options) < 2:
             raise RuntimeError("Не удалось распознать варианты вопроса {} кейса.".format(question_number))
-        question_text = normalize_question_text(self._extract_case_question(body_text, options[0]))
+        active = self._page.locator('nav[aria-label="Список вопросов"] li.active a.page-link')
+        if active.count() != 1 or active.inner_text().strip() != str(question_number):
+            raise RuntimeError("Номер открытого вопроса кейса не совпадает с ожидаемым.")
+        question_text = normalize_question_text(self._case_question_html())
+        if not question_text:
+            raise RuntimeError("Пустой текст вопроса кейса.")
         option_rows = []
         for label in option_locator.all():
-            text = normalize_text(label.inner_text())
+            text = normalize_text(label.inner_html())
             own_class = str(label.get_attribute("class") or "")
             parent_class = str(label.locator(".." ).get_attribute("class") or "")
             option_rows.append({

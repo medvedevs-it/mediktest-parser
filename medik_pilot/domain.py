@@ -3,6 +3,7 @@ import html
 import json
 import re
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any, Dict, Optional
 
 
@@ -20,24 +21,50 @@ class CollectedItem:
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+class _PlainTextParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self.parts.append("\n")
+
+    def handle_entityref(self, name):
+        self.parts.append("&" + name + ";")
+
+    def handle_charref(self, name):
+        self.parts.append("&#" + name + ";")
+
+
+def _strip_html(value: str) -> str:
+    # A numeric comparison such as '<70 mmHg' is text, not an HTML tag.
+    parser = _PlainTextParser()
+    parser.feed(value)
+    parser.close()
+    return "".join(parser.parts)
+
+
 def normalize_text(value: str) -> str:
     value = html.unescape(value)
     superscript = str.maketrans("0123456789+-=()", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾")
     subscript = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
     value = re.sub(
         r"<sup[^>]*>(.*?)</sup>",
-        lambda match: re.sub(r"<[^>]+>", "", match.group(1)).translate(superscript),
+        lambda match: _strip_html(match.group(1)).translate(superscript),
         value,
         flags=re.IGNORECASE | re.DOTALL,
     )
     value = re.sub(
         r"<sub[^>]*>(.*?)</sub>",
-        lambda match: re.sub(r"<[^>]+>", "", match.group(1)).translate(subscript),
+        lambda match: _strip_html(match.group(1)).translate(subscript),
         value,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
-    value = re.sub(r"<[^>]+>", "", value)
+    value = _strip_html(value)
     return re.sub(r"\s+", " ", value).strip()
 
 
@@ -148,6 +175,8 @@ def extract_case_diagnosis(payload: Dict[str, Any]) -> Optional[str]:
 
 
 def payload_status(kind: str, payload: Dict[str, Any]) -> str:
+    if payload.get("validation_error"):
+        return "invalid"
     if kind == "test":
         options = payload.get("options") or []
         if len(options) < 2:
